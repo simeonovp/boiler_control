@@ -14,6 +14,9 @@ const self = {
     time_in: 0,
     time_out: 0,
     last_integral: 0,
+    learned_ks: 0,
+    learned_t: 0,
+    learned_tot: 0,
   },
 
   pwm: 0,
@@ -37,13 +40,13 @@ const self = {
 
 }
 
-function tunePIDParameters() {
+function tunePIDParameters(send) {
   const ks = self.config.learned_ks
   const t = self.config.learned_t
   const tt = self.config.learned_tot
 
   // Guard against division by zero or unrealistic physical parameters
-  if (!ks || !t || !tt || (ks <= 0) || (t <= 0) || (tt <= 0)) return
+  if (!ks || !t || !tt || (0 >= ks) || (0 >= t) || (0 >= tt)) return
 
   // 1. Calculate proportional gain (Kp)
   const kp = (0.95 * t) / (ks * tt)
@@ -60,9 +63,24 @@ function tunePIDParameters() {
   self.config.pid_kp = Math.round(kp * 100) / 100
   self.config.pid_ki = Math.round(ki * 1000) / 1000
   self.config.pid_kd = Math.round(kd * 100) / 100
+
+  // Emit a specific tuning log entry to Output 2
+  // Convert the diagnostic object into a clean single-line JSON string
+  const diagnosticMsg = {
+      event: "TUNING_SUCCESS",
+      timestamp: Date.now(),
+      time_string: new Date().toISOString(),
+      calculated_ks: ks,
+      calculated_t: t,
+      calculated_deadtime: tt,
+      new_kp: self.config.pid_kp,
+      new_ki: self.config.pid_ki,
+      new_kd: self.config.pid_kd
+    }
+  send([null, { payload: JSON.stringify(diagnosticMsg) }])
 }
 
-function estimateSystemParameters(currentTemp, currentPwm) {
+function estimateSystemParameters(currentTemp, currentPwm, send) {
   const now = Date.now()
   const tempThreshold = 0.2
   const minPwmJump = 20
@@ -132,7 +150,7 @@ function estimateSystemParameters(currentTemp, currentPwm) {
       self.config.learned_tot = l.tot_time
 
       // Trigger automatic tuning
-      tunePIDParameters()
+      tunePIDParameters(send)
     }
   }
 
@@ -163,19 +181,33 @@ function onBoilerTempIn(msg, send) {
 
   // Helper function for clipping values
   const clamp = (val, min, max) => {
-    if (val > max) {
-      return max
-    }
-    if (val < min) {
-      return min
-    }
+    if (val > max) return max
+    if (val < min) return min
     return val
   }
 
   // Pre-calculate proportional and derivative parts
   const proportional = kp * diff
+
+  // Detect if the hardware is heating (temperature is rising or already high)
+  // If the temperature is cold and not rising, the flow is likely stopped
   const dt = (config.pid_dt && config.pid_dt > 0) ? config.pid_dt : 1e-6
-  const derivative = kd * (diff - self.prevError) / dt
+  const currentGradient = (processVariable - self.temp_out) / dt
+  self.temp_out = processVariable // store for next iteration
+
+  // Standby management: If temperature is low and not rising, freeze controller
+  const isHeaterHardwareOff = (processVariable < (config.set_temp - 5)) && (currentGradient <= 0)
+
+  if (isHeaterHardwareOff) {
+    self.integral = 0 // reset integral to prevent wind-up during standby
+    self.pwm = config.min_pwm || 10 // keep at minimum or default standby
+    msg.payload = Math.round(self.pwm)
+    msg.status = 'HARDWARE_STANDBY'
+    send(msg)
+    return
+  }
+
+  const derivative = -kd * currentGradient
 
   // 1. Calculate potential integral and its term
   const potentialIntegral = self.integral + (diff * config.pid_dt)
@@ -218,7 +250,7 @@ function onBoilerTempIn(msg, send) {
   self.pwm = clamp(self.pwm, minPwm, maxPwm)
   self.config.last_pwm = self.pwm
 
-  estimateSystemParameters(processVariable, self.pwm)
+  estimateSystemParameters(processVariable, self.pwm, send)
 
   // Debug
   msg.error = diff
@@ -229,39 +261,74 @@ function onBoilerTempIn(msg, send) {
   // Output data
   msg.payload = Math.round(self.pwm)
   msg.d_temp = diff
-  send(msg)
+
+  // Prepare comprehensive diagnostic message for Output 2 (File Node)
+  const l = self.learn
+  const diagnosticMsg = {
+    timestamp: Date.now(),
+    time_string: new Date().toISOString(),
+    process_variable: processVariable,
+    control_error: diff,
+    calculated_pwm: self.pwm,
+    proportional_term: Math.round(proportional * 100) / 100,
+    integral_term: Math.round(integralTerm * 100) / 100,
+    derivative_term: Math.round(derivative * 100) / 100,
+    raw_gradient: Math.round((currentGradient || 0) * 10000) / 10000,
+    filtered_gradient: Math.round((l.filtered_gradient || 0) * 10000) / 10000,
+    max_gradient: Math.round((l.max_gradient || 0) * 10000) / 10000,
+    has_responded: l.has_responded ? 1 : 0,
+    dead_time: l.tot_time,
+    config_kp: config.pid_kp,
+    config_ki: config.pid_ki,
+    config_kd: config.pid_kd,
+    learned_ks: config.learned_ks,
+    learned_t: config.learned_t,
+    learned_tot: config.learned_tot
+  }
+  send([msg, {payload: JSON.stringify(diagnosticMsg)}])
 }
 
 function onConfig(config) {
-  if (!config || typeof config !== 'object') return
+  if (!config || ('object' !== typeof config)) return
+  
   // whitelist config keys to avoid prototype pollution and unexpected fields
-  const allowed = ['pwm_control','set_temp','last_pwm','min_pwm','max_pwm','def_pwm','pwm_step','pid_kp','pid_ki','pid_kd','pid_dt','time_in','time_out','last_integral','integral_limit']
+  const allowed = ['pwm_control','set_temp','last_pwm','min_pwm','max_pwm','def_pwm','pwm_step','pid_kp','pid_ki','pid_kd','pid_dt','time_in','time_out','last_integral','integral_limit','learned_ks','learned_t','learned_tot']
   for (const k of allowed) {
     if (Object.prototype.hasOwnProperty.call(config, k)) {
-      if (k === 'pwm_control') self.config[k] = !!config[k]
+      if ('pwm_control' === k) self.config[k] = !!config[k]
       else if (Number.isFinite(Number(config[k]))) self.config[k] = Number(config[k])
       else self.config[k] = config[k]
     }
   }
+
   // ensure sensible min/max
   if (self.config.min_pwm > self.config.max_pwm) {
     const tmp = self.config.min_pwm
     self.config.min_pwm = self.config.max_pwm
     self.config.max_pwm = tmp
   }
+
+  const configLog = {
+    event: "CONFIG_CHANGED",
+    timestamp: Date.now(),
+    time_string: new Date().toISOString(),
+    updated_fields: config, // shows exactly what was sent in the inject payload
+    current_full_config: self.config // shows the state of the entire config matrix after the merge
+  }
+  send([null, { payload: JSON.stringify(configLog) }])
 }
 
 function send(msg) {
   node.send(msg)
 }
 
-function onInput (msg, send, done = () => {}) {
+function onInput(msg, send, done = () => {}) {
   Object.assign(self, context.get('boiler') || {})
   switch (msg.topic) {
     case 'config':
       onConfig(msg.payload)
       break
-    case 'boiler_temp_in':
+    case 'boiler_temp_out':
       onBoilerTempIn(msg, send)
       break
     default:
