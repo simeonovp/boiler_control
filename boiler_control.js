@@ -21,6 +21,124 @@ const self = {
   temp_out: 0,
   prevError: 0, // error from last iteration
   integral: 0, // accumulated error (integral)
+
+  // Additional internal states for learning
+  learn: {
+    pwm_jump_val: 0,     // PWM value before the jump
+    pwm_jump_time: 0,    // Timestamp when PWM changed
+    temp_jump_val: 0,    // Temperature before the jump
+    tot_time: 0,         // Detected sensor dead-time (Tt)
+    has_responded: false, // Flag to check if sensor started reacting
+    max_gradient: 0,
+    last_learn_temp: 0, // for gradient calculation
+    last_learn_time: 0,  // for gradient calculation
+    filtered_gradient: 0,
+  }
+
+}
+
+function tunePIDParameters() {
+  const ks = self.config.learned_ks
+  const t = self.config.learned_t
+  const tt = self.config.learned_tot
+
+  // Guard against division by zero or unrealistic physical parameters
+  if (!ks || !t || !tt || (ks <= 0) || (t <= 0) || (tt <= 0)) return
+
+  // 1. Calculate proportional gain (Kp)
+  const kp = (0.95 * t) / (ks * tt)
+
+  // 2. Calculate integral time (Ti) and convert to gain (Ki)
+  const ti = 1.4 * t
+  const ki = kp / ti
+
+  // 3. Calculate derivative time (Td) and convert to gain (Kd)
+  const td = 0.42 * tt
+  const kd = kp * td
+
+  // 4. Apply tuned parameters to the running system configuration
+  self.config.pid_kp = Math.round(kp * 100) / 100
+  self.config.pid_ki = Math.round(ki * 1000) / 1000
+  self.config.pid_kd = Math.round(kd * 100) / 100
+}
+
+function estimateSystemParameters(currentTemp, currentPwm) {
+  const now = Date.now()
+  const tempThreshold = 0.2
+  const minPwmJump = 20
+  const l = self.learn
+
+  // 1. Trigger learning phase on a significant PWM jump
+  if (Math.abs(currentPwm - l.pwm_jump_val) > minPwmJump && !l.pwm_jump_time) {
+    l.pwm_jump_time = now
+    l.pwm_jump_val = currentPwm
+    l.temp_jump_val = currentTemp
+    l.has_responded = false
+    l.max_gradient = 0
+    l.last_learn_temp = currentTemp
+    l.last_learn_time = now
+    return
+  }
+
+  // If no learning cycle is active, exit early
+  if (!l.pwm_jump_time) return
+
+  // Calculate time delta since the last sensor sample
+  const dt = (now - l.last_learn_time) / 1000
+  if (dt <= 0) return
+
+  // 2. Measure dead-time (sensor latency) until the temperature reacts
+  if (!l.has_responded) {
+    if (currentTemp > l.temp_jump_val + tempThreshold) {
+      l.tot_time = (now - l.pwm_jump_time) / 1000
+      l.has_responded = true
+    }
+    l.last_learn_temp = currentTemp
+    l.last_learn_time = now
+    return
+  }
+
+  // 3. Track and filter the gradient (heating rate in °C/second)
+  const rawGradient = (currentTemp - l.last_learn_temp) / dt
+  
+  // Smoothing factor alpha (0.2 means: 20% new value, 80% history)
+  const alpha = 0.2
+  l.filtered_gradient = (alpha * rawGradient) + ((1 - alpha) * l.filtered_gradient)
+  
+  if (l.filtered_gradient > l.max_gradient) l.max_gradient = l.filtered_gradient
+
+  // Update tracking references for the next sample
+  l.last_learn_temp = currentTemp
+  l.last_learn_time = now
+
+  // 4. Check for steady state (curve flattens out, gradient drops near 0)
+  const isSteadyState = l.filtered_gradient < 0.05 && (now - l.pwm_jump_time) / 1000 > l.tot_time + 5
+
+  if (!isSteadyState) return
+
+  const deltaPwm = l.pwm_jump_val - (self.config.last_pwm || 0)
+  const deltaTemp = currentTemp - l.temp_jump_val
+
+  if ((0 < Math.abs(deltaPwm)) && (0 < Math.abs(l.max_gradient))) {
+    // Ks = deltaTemp / deltaPwm
+    const ks = deltaTemp / deltaPwm
+    // T = deltaTemp / max_gradient (minus sensor dead-time)
+    const t = (deltaTemp / l.max_gradient) - l.tot_time
+
+    // Store learned parameters in config if valid
+    if ((0 < ks) && (0 < t)) {
+      self.config.learned_ks = ks
+      self.config.learned_t = t
+      self.config.learned_tot = l.tot_time
+
+      // Trigger automatic tuning
+      tunePIDParameters()
+    }
+  }
+
+  // Reset learning flags for the next opportunity
+  l.pwm_jump_time = 0
+
 }
 
 function onBoilerTempIn(msg, send) {
@@ -79,21 +197,15 @@ function onBoilerTempIn(msg, send) {
   // 5. Anti-windup decision with configurable hysteresis tolerance
   const nearLimit = Math.abs(potentialPwm - clippedPwm) < hyst
 
-  if (!isSaturated || !isDrivingDeeper || nearLimit) {
-    self.integral = potentialIntegral
-  }
+  if (!isSaturated || !isDrivingDeeper || nearLimit) self.integral = potentialIntegral
 
   // 6. Secondary hard-clamp protection for the integral state
   const integralLimit = Number.isFinite(config.integral_limit)
     ? Math.abs(config.integral_limit)
     : Math.abs(maxPwm / Math.max(Math.abs(ki), 1e-6))
 
-  if (self.integral > integralLimit) {
-    self.integral = integralLimit
-  }
-  else if (self.integral < -integralLimit) {
-    self.integral = -integralLimit
-  }
+  if (self.integral > integralLimit) self.integral = integralLimit
+  else if (self.integral < -integralLimit) self.integral = -integralLimit
 
   // Final PWM value using the verified integral state
   const integralTerm = ki * self.integral
@@ -104,6 +216,9 @@ function onBoilerTempIn(msg, send) {
 
   // Clamp output PWM
   self.pwm = clamp(self.pwm, minPwm, maxPwm)
+  self.config.last_pwm = self.pwm
+
+  estimateSystemParameters(processVariable, self.pwm)
 
   // Debug
   msg.error = diff
