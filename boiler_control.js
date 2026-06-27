@@ -31,45 +31,79 @@ function onBoilerTempIn(msg, send) {
   const processVariable =  msg.payload // current temperature
   if (!Number.isFinite(processVariable)) return
 
-  // ensure numeric config fields
-  const ensureNumber = (k, fallback = 0) => {
-    const v = Number(self.config[k])
-    self.config[k] = Number.isFinite(v) ? v : fallback
-  }
-  ensureNumber('set_temp', 0)
-  ensureNumber('pid_kp', 0)
-  ensureNumber('pid_ki', 0)
-  ensureNumber('pid_kd', 0)
-  ensureNumber('pid_dt', 0.1)
-  ensureNumber('min_pwm', 0)
-  ensureNumber('max_pwm', 100)
+  // config is validated on update via `onConfig`; avoid redundant checks here for performance
 
   // Calculation
   const diff = (config.set_temp - processVariable)
-  const proportional = config.pid_kp * diff
+  // Ensure critical configuration values are numeric before calculation
+  const kp = Number.isFinite(config.pid_kp) ? config.pid_kp : 0
+  const ki = Number.isFinite(config.pid_ki) ? config.pid_ki : 0
+  const kd = Number.isFinite(config.pid_kd) ? config.pid_kd : 0
+  const minPwm = Number.isFinite(config.min_pwm) ? config.min_pwm : 0
+  const maxPwm = Number.isFinite(config.max_pwm) ? config.max_pwm : 100
+  const hyst = Number.isFinite(config.hysteresis) ? config.hysteresis : 0.5
 
-  // Integral part (Error sum over the time) with anti-windup
-  self.integral += diff * config.pid_dt
-  // calculate an integral clamp (allow override via config.integral_limit)
+  // Helper function for clipping values
+  const clamp = (val, min, max) => {
+    if (val > max) {
+      return max
+    }
+    if (val < min) {
+      return min
+    }
+    return val
+  }
+
+  // Pre-calculate proportional and derivative parts
+  const proportional = kp * diff
+  const dt = (config.pid_dt && config.pid_dt > 0) ? config.pid_dt : 1e-6
+  const derivative = kd * (diff - self.prevError) / dt
+
+  // 1. Calculate potential integral and its term
+  const potentialIntegral = self.integral + (diff * config.pid_dt)
+  const potentialIntegralTerm = ki * potentialIntegral
+
+  // 2. Calculate potential total PWM value
+  const potentialPwm = proportional + potentialIntegralTerm + derivative
+
+  // 3. Determine actuator state (use real feedback if available, fallback to simulation)
+  const realFeedback = msg.actuator_feedback
+  const clippedPwm = Number.isFinite(realFeedback)
+    ? clamp(realFeedback, minPwm, maxPwm)
+    : clamp(potentialPwm, minPwm, maxPwm)
+
+  // 4. Check for saturation
+  const isSaturated = potentialPwm !== clippedPwm
+  const isDrivingDeeper = ki !== 0 && Math.sign(diff) === Math.sign(ki)
+
+  // 5. Anti-windup decision with configurable hysteresis tolerance
+  const nearLimit = Math.abs(potentialPwm - clippedPwm) < hyst
+
+  if (!isSaturated || !isDrivingDeeper || nearLimit) {
+    self.integral = potentialIntegral
+  }
+
+  // 6. Secondary hard-clamp protection for the integral state
   const integralLimit = Number.isFinite(config.integral_limit)
     ? Math.abs(config.integral_limit)
-    : Math.abs(config.max_pwm / Math.max(config.pid_ki, 1e-6))
-  if (self.integral > integralLimit) self.integral = integralLimit
-  if (self.integral < -integralLimit) self.integral = -integralLimit
-  const integralTerm = config.pid_ki * self.integral
+    : Math.abs(maxPwm / Math.max(Math.abs(ki), 1e-6))
 
-  // differential part (Rate of teh error change)
-  const dt = (config.pid_dt && config.pid_dt > 0) ? config.pid_dt : 1e-6
-  const derivative = config.pid_kd * (diff - self.prevError) / dt
+  if (self.integral > integralLimit) {
+    self.integral = integralLimit
+  }
+  else if (self.integral < -integralLimit) {
+    self.integral = -integralLimit
+  }
 
+  // Final PWM value using the verified integral state
+  const integralTerm = ki * self.integral
   self.pwm = proportional + integralTerm + derivative
 
   // persist error for the next iteration
   self.prevError = diff
 
-  // Check min/max
-  if (self.pwm > config.max_pwm) self.pwm = config.max_pwm
-  if (self.pwm < config.min_pwm) self.pwm = config.min_pwm
+  // Clamp output PWM
+  self.pwm = clamp(self.pwm, minPwm, maxPwm)
 
   // Debug
   msg.error = diff
@@ -125,4 +159,4 @@ function onClose(done = () => {}) {
   send({topic: 'config', payload: self.config})
 }
 
-if (msg.payload) onInput(msg, send)
+if (msg) onInput(msg, send)
