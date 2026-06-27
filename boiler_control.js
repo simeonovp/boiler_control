@@ -17,6 +17,7 @@ const self = {
     learned_ks: 0,
     learned_t: 0,
     learned_tot: 0,
+    is_learned: false,
   },
 
   pwm: 0,
@@ -37,7 +38,6 @@ const self = {
     last_learn_time: 0,  // for gradient calculation
     filtered_gradient: 0,
   }
-
 }
 
 function tunePIDParameters(send) {
@@ -63,20 +63,21 @@ function tunePIDParameters(send) {
   self.config.pid_kp = Math.round(kp * 100) / 100
   self.config.pid_ki = Math.round(ki * 1000) / 1000
   self.config.pid_kd = Math.round(kd * 100) / 100
+  self.config.is_learned = true
 
   // Emit a specific tuning log entry to Output 2
   // Convert the diagnostic object into a clean single-line JSON string
   const diagnosticMsg = {
-      event: "TUNING_SUCCESS",
-      timestamp: Date.now(),
-      time_string: new Date().toISOString(),
-      calculated_ks: ks,
-      calculated_t: t,
-      calculated_deadtime: tt,
-      new_kp: self.config.pid_kp,
-      new_ki: self.config.pid_ki,
-      new_kd: self.config.pid_kd
-    }
+    event: "TUNING_SUCCESS",
+    timestamp: Date.now(),
+    time_string: new Date().toISOString(),
+    calculated_ks: ks,
+    calculated_t: t,
+    calculated_deadtime: tt,
+    new_kp: self.config.pid_kp,
+    new_ki: self.config.pid_ki,
+    new_kd: self.config.pid_kd
+  }
   send([null, { payload: JSON.stringify(diagnosticMsg) }])
 }
 
@@ -87,7 +88,7 @@ function estimateSystemParameters(currentTemp, currentPwm, send) {
   const l = self.learn
 
   // 1. Trigger learning phase on a significant PWM jump
-  if (Math.abs(currentPwm - l.pwm_jump_val) > minPwmJump && !l.pwm_jump_time) {
+  if ((Math.abs(currentPwm - l.pwm_jump_val) > minPwmJump) && !l.pwm_jump_time) {
     l.pwm_jump_time = now
     l.pwm_jump_val = currentPwm
     l.temp_jump_val = currentTemp
@@ -164,13 +165,16 @@ function onBoilerTempIn(msg, send) {
   if (!config.pwm_control) return
 
   // Input data
-  const processVariable =  msg.payload // current temperature
+  const processVariable = msg.payload // current temperature in 0.1 °C
   if (!Number.isFinite(processVariable)) return
 
-  // config is validated on update via `onConfig`; avoid redundant checks here for performance
+  // Helper function for clipping values (Moved up for availability)
+  const clamp = (val, min, max) => {
+    if (val > max) return max
+    if (val < min) return min
+    return val
+  }
 
-  // Calculation
-  const diff = (config.set_temp - processVariable)
   // Ensure critical configuration values are numeric before calculation
   const kp = Number.isFinite(config.pid_kp) ? config.pid_kp : 0
   const ki = Number.isFinite(config.pid_ki) ? config.pid_ki : 0
@@ -179,59 +183,57 @@ function onBoilerTempIn(msg, send) {
   const maxPwm = Number.isFinite(config.max_pwm) ? config.max_pwm : 100
   const hyst = Number.isFinite(config.hysteresis) ? config.hysteresis : 0.5
 
-  // Helper function for clipping values
-  const clamp = (val, min, max) => {
-    if (val > max) return max
-    if (val < min) return min
-    return val
-  }
-
-  // Pre-calculate proportional and derivative parts
+  // 1. Core calculation using native 0.1°C units for input variables
+  const diff = (config.set_temp - processVariable)
+  const tempSpread = processVariable - (self.temp_in || processVariable)
+  
+  // Proportional term outputs direct % PWM because Kp compensates for the 10x larger diff
   const proportional = kp * diff
 
-  // Detect if the hardware is heating (temperature is rising or already high)
-  // If the temperature is cold and not rising, the flow is likely stopped
   const dt = (config.pid_dt && config.pid_dt > 0) ? config.pid_dt : 1e-6
+  
+  // Gradient is tracked in tenth-degrees per second (0.1 °C/s)
   const currentGradient = (processVariable - self.temp_out) / dt
-  self.temp_out = processVariable // store for next iteration
+  self.temp_out = processVariable 
 
-  // Standby management: If temperature is low and not rising, freeze controller
-  const isHeaterHardwareOff = (processVariable < (config.set_temp - 5)) && (currentGradient <= 0)
+  // Standby management: 5.0°C equals 50 in tenth-degrees
+  const isHeaterHardwareOff = (processVariable < (config.set_temp - 50)) && (0 >= currentGradient)
 
   if (isHeaterHardwareOff) {
-    self.integral = 0 // reset integral to prevent wind-up during standby
-    self.pwm = config.min_pwm || 10 // keep at minimum or default standby
+    self.integral = 0 
+    self.pwm = config.min_pwm || 10 
     msg.payload = Math.round(self.pwm)
     msg.status = 'HARDWARE_STANDBY'
     send(msg)
     return
   }
 
+  // Derivative term outputs direct % PWM because Kd compensates for the 10x larger gradient
   const derivative = -kd * currentGradient
 
-  // 1. Calculate potential integral and its term
+  // 2. Integral accumulation in direct % PWM scale
   const potentialIntegral = self.integral + (diff * config.pid_dt)
   const potentialIntegralTerm = ki * potentialIntegral
 
-  // 2. Calculate potential total PWM value
+  // 3. Total ideal PWM output in direct % scale (Value range 0 to 100)
   const potentialPwm = proportional + potentialIntegralTerm + derivative
 
-  // 3. Determine actuator state (use real feedback if available, fallback to simulation)
-  const realFeedback = msg.actuator_feedback
-  const clippedPwm = Number.isFinite(realFeedback)
-    ? clamp(realFeedback, minPwm, maxPwm)
-    : clamp(potentialPwm, minPwm, maxPwm)
+  const clippedPwm = clamp(potentialPwm, minPwm, maxPwm)
 
-  // 4. Check for saturation
+  // 4. Saturation and safety checks using direct % scale
   const isSaturated = potentialPwm !== clippedPwm
-  const isDrivingDeeper = ki !== 0 && Math.sign(diff) === Math.sign(ki)
-
-  // 5. Anti-windup decision with configurable hysteresis tolerance
+  const isDrivingDeeper = (0 !== ki) && (Math.sign(diff) === Math.sign(ki))
   const nearLimit = Math.abs(potentialPwm - clippedPwm) < hyst
+  const isHeaterFailing = (potentialPwm >= maxPwm) && (0 >= tempSpread)
+  
+  // Core Anti-Windup block condition: freeze integration if saturated and driving deeper without being near the limit
+  const antiWindupBlock = (isSaturated && isDrivingDeeper && !nearLimit) || isHeaterFailing
 
-  if (!isSaturated || !isDrivingDeeper || nearLimit) self.integral = potentialIntegral
+  if (!antiWindupBlock) {
+    self.integral = potentialIntegral
+  }
 
-  // 6. Secondary hard-clamp protection for the integral state
+  // 5. Secondary hard-clamp protection for the integral state
   const integralLimit = Number.isFinite(config.integral_limit)
     ? Math.abs(config.integral_limit)
     : Math.abs(maxPwm / Math.max(Math.abs(ki), 1e-6))
@@ -239,18 +241,17 @@ function onBoilerTempIn(msg, send) {
   if (self.integral > integralLimit) self.integral = integralLimit
   else if (self.integral < -integralLimit) self.integral = -integralLimit
 
-  // Final PWM value using the verified integral state
+  // 6. Compute final PWM and clamp to hardware boundaries
   const integralTerm = ki * self.integral
-  self.pwm = proportional + integralTerm + derivative
+  const rawPwm = proportional + integralTerm + derivative
+  
+  self.pwm = clamp(rawPwm, minPwm, maxPwm)
+  self.config.last_pwm = self.pwm
 
   // persist error for the next iteration
   self.prevError = diff
 
-  // Clamp output PWM
-  self.pwm = clamp(self.pwm, minPwm, maxPwm)
-  self.config.last_pwm = self.pwm
-
-  estimateSystemParameters(processVariable, self.pwm, send)
+  if (!self.config.is_learned) estimateSystemParameters(processVariable, self.pwm, send)
 
   // Debug
   msg.error = diff
@@ -265,9 +266,12 @@ function onBoilerTempIn(msg, send) {
   // Prepare comprehensive diagnostic message for Output 2 (File Node)
   const l = self.learn
   const diagnosticMsg = {
+    event: "ITERATION_LOG",
     timestamp: Date.now(),
     time_string: new Date().toISOString(),
     process_variable: processVariable,
+    inlet_temp: self.temp_in || 0,
+    temp_spread: tempSpread,
     control_error: diff,
     calculated_pwm: self.pwm,
     proportional_term: Math.round(proportional * 100) / 100,
@@ -327,6 +331,9 @@ function onInput(msg, send, done = () => {}) {
   switch (msg.topic) {
     case 'config':
       onConfig(msg.payload)
+      break
+    case 'boiler_temp_in':
+      self.temp_in = msg.payload
       break
     case 'boiler_temp_out':
       onBoilerTempIn(msg, send)
