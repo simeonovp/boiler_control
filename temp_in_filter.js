@@ -6,6 +6,7 @@ function send_temp(name, temp, time) {
 
   const temp_key = `temp_${name}`
   const last_temp = context.get(temp_key) || 0
+
   context.set(temp_key, temp_val)
 
   const time_key = `time_${name}`
@@ -19,6 +20,7 @@ function send_temp(name, temp, time) {
     d_time: last_time ? (new Date(time) - new Date(last_time)) / 1000 : 0
   })
 }
+
 
 for (const key of Object.keys(msg.payload)) {
   if (!key.startsWith('DS18B20')) continue

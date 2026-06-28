@@ -46,17 +46,17 @@ function tunePIDParameters(send) {
   const tt = self.config.learned_tot
 
   // Guard against division by zero or unrealistic physical parameters
-  if (!ks || !t || !tt || (0 >= ks) || (0 >= t) || (0 >= tt)) return
+  if (!ks || !t || !tt || (0 >= ks) || (0 >= t) || (0 >= tt)) return send([null, { payload: {event: "TUNING_FAILED"} }])
 
-  // 1. Calculate proportional gain (Kp)
-  const kp = (0.95 * t) / (ks * tt)
+  // 1. Calculate proportional gain (Kp) tailored for 0% overshoot setpoint tracking
+  const kp = (0.6 * t) / (ks * tt)
 
   // 2. Calculate integral time (Ti) and convert to gain (Ki)
-  const ti = 1.4 * t
+  const ti = 4.0 * tt
   const ki = kp / ti
 
   // 3. Calculate derivative time (Td) and convert to gain (Kd)
-  const td = 0.42 * tt
+  const td = 0.5 * tt
   const kd = kp * td
 
   // 4. Apply tuned parameters to the running system configuration
@@ -78,138 +78,218 @@ function tunePIDParameters(send) {
     new_ki: self.config.pid_ki,
     new_kd: self.config.pid_kd
   }
-  send([null, { payload: JSON.stringify(diagnosticMsg) }])
+  send([null, { payload: diagnosticMsg }])
 }
 
-function estimateSystemParameters(currentTemp, currentPwm, send) {
+function estimateSystemParameters(currentTemp, send) {
   const now = Date.now()
   const tempThreshold = 0.2
   const minPwmJump = 20
   const l = self.learn
 
   // 1. Trigger learning phase on a significant PWM jump
-  if ((Math.abs(currentPwm - l.pwm_jump_val) > minPwmJump) && !l.pwm_jump_time) {
+  if ((Math.abs(self.pwm - l.pwm_jump_val) > minPwmJump) && !l.pwm_jump_time) {
     l.pwm_jump_time = now
-    l.pwm_jump_val = currentPwm
+    l.pwm_jump_val = self.pwm
     l.temp_jump_val = currentTemp
     l.has_responded = false
     l.max_gradient = 0
     l.last_learn_temp = currentTemp
     l.last_learn_time = now
-    return
+    return send([null, { payload: {event: "LEARN_RETURN 1"} }])
   }
 
   // If no learning cycle is active, exit early
-  if (!l.pwm_jump_time) return
+  if (!l.pwm_jump_time) return send([null, { payload: {event: "LEARN_RETURN 2", currentPwm:self.pwm, pwm_jump_val: l.pwm_jump_val, pwm_jump_time: l.pwm_jump_time} }])
 
   // Calculate time delta since the last sensor sample
   const dt = (now - l.last_learn_time) / 1000
-  if (dt <= 0) return
+  if (dt <= 0) return  send([null, { payload: {event: "LEARN_RETURN 3"} }])
 
   // 2. Measure dead-time (sensor latency) until the temperature reacts
-  if (!l.has_responded) {
+  if (false === l.has_responded) {
     if (currentTemp > l.temp_jump_val + tempThreshold) {
       l.tot_time = (now - l.pwm_jump_time) / 1000
       l.has_responded = true
     }
-    l.last_learn_temp = currentTemp
-    l.last_learn_time = now
-    return
+    else {
+      l.last_learn_temp = currentTemp
+      l.last_learn_time = now
+      return  send([null, { payload: {event: "LEARN_RETURN 4"} }]) // Safe exit only if no physical response has occurred yet
+    }
   }
 
   // 3. Track and filter the gradient (heating rate in °C/second)
   const rawGradient = (currentTemp - l.last_learn_temp) / dt
-  
+
+  // Catch unitialized context state to prevent fatal NaN propagation
+  if ('undefined' === typeof l.filtered_gradient) l.filtered_gradient = rawGradient
+
   // Smoothing factor alpha (0.2 means: 20% new value, 80% history)
   const alpha = 0.2
-  l.filtered_gradient = (alpha * rawGradient) + ((1 - alpha) * l.filtered_gradient)
-  
-  if (l.filtered_gradient > l.max_gradient) l.max_gradient = l.filtered_gradient
+
+  // Directly enforce updates on the global memory context to bypass reference drift
+  self.learn.filtered_gradient = ((alpha * rawGradient) + ((1 - alpha) * (self.learn.filtered_gradient || 0)))
+
+  if (self.learn.filtered_gradient > self.learn.max_gradient) {
+    self.learn.max_gradient = self.learn.filtered_gradient
+  }
 
   // Update tracking references for the next sample
   l.last_learn_temp = currentTemp
   l.last_learn_time = now
 
   // 4. Check for steady state (curve flattens out, gradient drops near 0)
-  const isSteadyState = l.filtered_gradient < 0.05 && (now - l.pwm_jump_time) / 1000 > l.tot_time + 5
+  const isSteadyState = ((self.learn.filtered_gradient < 0.15) && ((now - self.learn.pwm_jump_time) / 1000 > (self.learn.tot_time + 5)))
 
-  if (!isSteadyState) return
+  if (!isSteadyState) return  send([null, { payload: {
+    event: "LEARN_RETURN 5", 
+    filtered_gradient: self.learn.filtered_gradient,
+    tot_time: self.learn.tot_time,
+    dt_since_jump: (now - self.learn.pwm_jump_time) / 1000,
+  } }])
 
-  const deltaPwm = l.pwm_jump_val - (self.config.last_pwm || 0)
+  // Fix the deltaPwm calculation: If the system was armed in standby at max power,
+  // the true physical step response jump was from 0% to the current active PWM value.
+  const deltaPwm = (l.pwm_jump_val > 0) ? l.pwm_jump_val : 100
   const deltaTemp = currentTemp - l.temp_jump_val
 
   if ((0 < Math.abs(deltaPwm)) && (0 < Math.abs(l.max_gradient))) {
-    // Ks = deltaTemp / deltaPwm
     const ks = deltaTemp / deltaPwm
-    // T = deltaTemp / max_gradient (minus sensor dead-time)
     const t = (deltaTemp / l.max_gradient) - l.tot_time
 
-    // Store learned parameters in config if valid
-    if ((0 < ks) && (0 < t)) {
+    // Only allow parameter storage if the physical measurements are within realistic bounds
+    if ((0.0 < ks) && (0.0 < t) && (t < 1200.0) && (l.tot_time < 60.0)) {
       self.config.learned_ks = ks
       self.config.learned_t = t
       self.config.learned_tot = l.tot_time
 
-      // Trigger automatic tuning
+      // Trigger automatic tuning parameters
       tunePIDParameters(send)
     }
   }
+}
 
-  // Reset learning flags for the next opportunity
-  l.pwm_jump_time = 0
+function resetLearn() {
+  if (self.learn.pwm_jump_time) return
 
+  self.config.pid_kp = 1.0
+  self.config.pid_ki = 0.05
+  self.config.pid_kd = 0.5
+  self.config.learned_ks = 0
+  self.config.learned_t = 0
+  self.config.learned_tot = 0
+  self.integral = 0
+  
+  if (self.learn) {
+    self.learn.pwm_jump_time = 0
+    self.learn.pwm_jump_val = 0
+    self.learn.temp_jump_val = 0
+    self.learn.tot_time = 0
+    self.learn.has_responded = false
+    self.learn.max_gradient = 0
+    self.learn.last_learn_temp = 0
+    self.learn.last_learn_time = 0
+    self.learn.filtered_gradient = 0
+  }
 }
 
 function onBoilerTempIn(msg, send) {
   const config = self.config
   if (!config.pwm_control) return
 
+  if ((false === self.config.is_learned) && !self.learn.pwm_jump_time) resetLearn()
+
   // Input data
   const processVariable = msg.payload // current temperature in 0.1 °C
   if (!Number.isFinite(processVariable)) return
 
-  // Helper function for clipping values (Moved up for availability)
+  // Helper function for clipping values
   const clamp = (val, min, max) => {
     if (val > max) return max
     if (val < min) return min
     return val
   }
 
-  // Ensure critical configuration values are numeric before calculation
-  const kp = Number.isFinite(config.pid_kp) ? config.pid_kp : 0
-  const ki = Number.isFinite(config.pid_ki) ? config.pid_ki : 0
-  const kd = Number.isFinite(config.pid_kd) ? config.pid_kd : 0
-  const minPwm = Number.isFinite(config.min_pwm) ? config.min_pwm : 0
+  // Determine tuning mode: force robust hardcoded defaults until system is fully learned
+  let kp = 1.0
+  let ki = 0.05
+  let kd = 0.5
+
+  if (true === config.is_learned) {
+    kp = Number.isFinite(config.pid_kp) ? config.pid_kp : 1.0
+    ki = Number.isFinite(config.pid_ki) ? config.pid_ki : 0.05
+    kd = Number.isFinite(config.pid_kd) ? config.pid_kd : 0.5
+  }
+
+  // 1. HARD TUNING WALL: Force absolute 100% PWM during the ENTIRE learning phase
+  // The PID controller is strictly forbidden from throttling down until is_learned becomes true
+  const minPwm = (false === config.is_learned) ? 100 : (Number.isFinite(config.min_pwm) ? config.min_pwm : 0)
   const maxPwm = Number.isFinite(config.max_pwm) ? config.max_pwm : 100
   const hyst = Number.isFinite(config.hysteresis) ? config.hysteresis : 0.5
 
-  // 1. Core calculation using native 0.1°C units for input variables
   const diff = (config.set_temp - processVariable)
   const tempSpread = processVariable - (self.temp_in || processVariable)
-  
-  // Proportional term outputs direct % PWM because Kp compensates for the 10x larger diff
-  const proportional = kp * diff
-
   const dt = (config.pid_dt && config.pid_dt > 0) ? config.pid_dt : 1e-6
   
-  // Gradient is tracked in tenth-degrees per second (0.1 °C/s)
-  const currentGradient = (processVariable - self.temp_out) / dt
-  self.temp_out = processVariable 
+  const proportional = (kp * diff)
+
+  // 2. Dual Gradient Engine: Use raw data for physical identification, but filtered data for PID execution
+  const rawGradient = (0 === self.temp_out) ? 0 : (processVariable - self.temp_out) / dt
+
+  if ('undefined' === typeof self.filtered_gradient_mem) {
+    self.filtered_gradient_mem = rawGradient
+  }
+  self.filtered_gradient_mem = (0.2 * rawGradient) + (0.8 * self.filtered_gradient_mem)
+
+  // Identification module receives the true, unfiltered physics to capture the real maximum slope
+  const identificationGradient = (false === config.is_learned) ? rawGradient : self.filtered_gradient_mem
+  // Active PID controller receives the smooth, filtered gradient to prevent contactor chattering
+  const currentGradient = self.filtered_gradient_mem
+
+  // Environmental drift filtering: flow is only verified if temperature changes faster than 0.1°C/s
+  // A gradient magnitude above 1.0 (tenth-degrees/second) clearly separates mechanical flow from static ambient cooling
+  const isDynamicFlowDetected = (Math.abs(currentGradient) > 1.0)
 
   // Standby management: 5.0°C equals 50 in tenth-degrees
-  const isHeaterHardwareOff = (processVariable < (config.set_temp - 50)) && (0 >= currentGradient)
+  // The system enters standby ONLY if it is cold AND static (no heavy dynamic gradient detected)
+  const isHeaterHardwareOff = (processVariable < (config.set_temp - 50)) && (!isDynamicFlowDetected)
+
+  // Overwrite history reference for the next iteration step
+  self.temp_out = processVariable 
 
   if (isHeaterHardwareOff) {
-    self.integral = 0 
-    self.pwm = config.min_pwm || 10 
-    msg.payload = Math.round(self.pwm)
+    // Inject a massive integral charge to keep the PWM locked at 100% until water is hot
+    self.integral = Number.isFinite(config.integral_limit) ? config.integral_limit : 100
+    // Force 100% PWM during standby so the heater instantly fires the moment the mechanical contactor closes
+    if ('undefined' === typeof self.pwm) self.pwm = config.max_pwm || 100 
+    self.was_in_standby = true 
+    msg.self_pwm = self.pwm
+    msg.payload = Math.round(self.pwm * 10.23)
     msg.status = 'HARDWARE_STANDBY'
-    send(msg)
+    send([msg, msg])
     return
   }
 
-  // Derivative term outputs direct % PWM because Kd compensates for the 10x larger gradient
-  const derivative = -kd * currentGradient
+  // Hardware Start Boost: Force 100% PWM immediately on the very first event after standby
+  if (true === self.was_in_standby) {
+    self.was_in_standby = false 
+    // Inject a massive integral charge to keep the PWM locked at 100% until water is hot
+    self.integral = Number.isFinite(config.integral_limit) ? config.integral_limit : 100
+    if ('undefined' === typeof self.pwm) self.pwm = config.max_pwm || 100 
+
+    msg.self_pwm = self.pwm
+    msg.payload = Math.round(self.pwm * 10.23)
+    msg.status = 'HARDWARE_WAKEUP_BOOST'
+
+    self.prevError = diff
+    send([msg, msg])
+    return
+  }
+
+  // Derivative term outputs direct % PWM corrected for the 0.1 scale and phase alignment
+  // Derivative term acts as a dampening brake against rapid temperature changes
+  const derivative = -kd * (currentGradient / 10)
 
   // 2. Integral accumulation in direct % PWM scale
   const potentialIntegral = self.integral + (diff * config.pid_dt)
@@ -226,7 +306,6 @@ function onBoilerTempIn(msg, send) {
   const nearLimit = Math.abs(potentialPwm - clippedPwm) < hyst
   const isHeaterFailing = (potentialPwm >= maxPwm) && (0 >= tempSpread)
   
-  // Core Anti-Windup block condition: freeze integration if saturated and driving deeper without being near the limit
   const antiWindupBlock = (isSaturated && isDrivingDeeper && !nearLimit) || isHeaterFailing
 
   if (!antiWindupBlock) {
@@ -251,7 +330,10 @@ function onBoilerTempIn(msg, send) {
   // persist error for the next iteration
   self.prevError = diff
 
-  if (!self.config.is_learned) estimateSystemParameters(processVariable, self.pwm, send)
+  // Execute parameter identification during the entire tuning run
+  if (false === self.config.is_learned) {
+    estimateSystemParameters(processVariable, send)
+  }
 
   // Debug
   msg.error = diff
@@ -260,7 +342,8 @@ function onBoilerTempIn(msg, send) {
   msg.derivative = Math.round(derivative * 100) / 100
 
   // Output data
-  msg.payload = Math.round(self.pwm)
+  msg.self_pwm = self.pwm
+  msg.payload = Math.round(self.pwm * 10.23)
   msg.d_temp = diff
 
   // Prepare comprehensive diagnostic message for Output 2 (File Node)
@@ -277,7 +360,7 @@ function onBoilerTempIn(msg, send) {
     proportional_term: Math.round(proportional * 100) / 100,
     integral_term: Math.round(integralTerm * 100) / 100,
     derivative_term: Math.round(derivative * 100) / 100,
-    raw_gradient: Math.round((currentGradient || 0) * 10000) / 10000,
+    raw_gradient: Math.round((rawGradient  || 0) * 10000) / 10000,
     filtered_gradient: Math.round((l.filtered_gradient || 0) * 10000) / 10000,
     max_gradient: Math.round((l.max_gradient || 0) * 10000) / 10000,
     has_responded: l.has_responded ? 1 : 0,
@@ -285,16 +368,25 @@ function onBoilerTempIn(msg, send) {
     config_kp: config.pid_kp,
     config_ki: config.pid_ki,
     config_kd: config.pid_kd,
+    config_dt: config.pid_dt,
     learned_ks: config.learned_ks,
     learned_t: config.learned_t,
-    learned_tot: config.learned_tot
+    learned_tot: config.learned_tot,
+    is_learned: config.is_learned,
   }
-  send([msg, {payload: JSON.stringify(diagnosticMsg)}])
+  send([msg, {payload: diagnosticMsg}])
 }
 
-function onConfig(config) {
+function onConfig(config, send) {
   if (!config || ('object' !== typeof config)) return
   
+  // Hard Reset Trigger: If system is not learned, instantly wipe out constants 
+  // and restore secure hardware default values directly inside the registry
+  if (false === self.config.is_learned) resetLearn()
+
+  // Process the rest of your standard incoming configuration fields...
+  if (Number.isFinite(config.set_temp)) self.config.set_temp = config.set_temp
+
   // whitelist config keys to avoid prototype pollution and unexpected fields
   const allowed = ['pwm_control','set_temp','last_pwm','min_pwm','max_pwm','def_pwm','pwm_step','pid_kp','pid_ki','pid_kd','pid_dt','time_in','time_out','last_integral','integral_limit','learned_ks','learned_t','learned_tot']
   for (const k of allowed) {
@@ -319,7 +411,7 @@ function onConfig(config) {
     updated_fields: config, // shows exactly what was sent in the inject payload
     current_full_config: self.config // shows the state of the entire config matrix after the merge
   }
-  send([null, { payload: JSON.stringify(configLog) }])
+  send([null, { payload: configLog }])
 }
 
 function send(msg) {
@@ -330,13 +422,66 @@ function onInput(msg, send, done = () => {}) {
   Object.assign(self, context.get('boiler') || {})
   switch (msg.topic) {
     case 'config':
-      onConfig(msg.payload)
+      onConfig(msg.payload, send)
+      break
+    case 'learn':
+      self.config.is_learned = msg.payload
+      self.learn.pwm_jump_time = 0
+      onConfig({}, send)
       break
     case 'boiler_temp_in':
-      self.temp_in = msg.payload
+      self.temp_in = msg.payload // Store the inlet value safely in context memory
+      
+      // Protect PID calculus: overwrite payload with last known outlet temperature
+      // before forcing the execution loop to update dynamic flow spreads instantly
+      msg.payload = (self.temp_out || self.config.set_temp)
+      onBoilerTempIn(msg, send)
       break
     case 'boiler_temp_out':
+      // Adaptive Jitter Filter: Apply deadband ONLY when system is fully learned
+      // This protects the mechanical contactor during daily operation, but keeps events flowing during tuning
+      if (true === self.config.is_learned) {
+        const lastOutlet = self.temp_out || 0
+        const jitterThreshold = 1 // 1 equals 0.1 °C
+        
+        if ((0 !== lastOutlet) && (Math.abs(msg.payload - lastOutlet) <= jitterThreshold)) {
+          break // Suppress message execution to protect hardware from jitter
+        }
+      }
       onBoilerTempIn(msg, send)
+      break
+    case 'boiler_update':
+      // 1. Thermodynamic Wakeup Trigger via Inlet Temperature Drop
+      if (Number.isFinite(msg.payload.temp_in)) {
+        const lastInlet = (self.temp_in || msg.payload.temp_in)
+        self.temp_in = msg.payload.temp_in
+        
+        // If the inlet drops by more than 0.2°C, water is flowing! Break out of standby instantly.
+        if (((lastInlet - msg.payload.temp_in) > 2) && (true === self.was_in_standby)) {
+          self.was_in_standby = false
+          self.integral = 0
+          self.pwm = (self.config.max_pwm || 100)
+          
+          const wakeupMsg = {
+            topic: "boiler_temp_out",
+            payload: Math.round(self.pwm * 10.23),
+            status: "HARDWARE_WAKEUP_INLET_BOOST"
+          }
+          send([wakeupMsg, null])
+          break // Exit early, the immediate 100% boost is fired to lock the contactor
+        }
+      }
+      
+      // 2. Primary PID Loop Execution on Outlet Changes
+      // If temp_out is missing in this frame, load the last known value from memory to prevent math crashes
+      if (Number.isFinite(msg.payload.temp_out)) {
+        self.temp_out_buffer = msg.payload.temp_out
+      }
+      
+      if (Number.isFinite(self.temp_out_buffer)) {
+        msg.payload = self.temp_out_buffer
+        onBoilerTempIn(msg, send)
+      }
       break
     default:
       return
